@@ -1,8 +1,13 @@
-# 路面逐层验收弯沉计算器
+# 路面弯沉计算（弹性层状体系）
 
-基于**弹性层状体系理论**的沥青路面弯沉计算网页工具。输入各结构层厚度、回弹模量与泊松比，即刻算出**落锤式弯沉仪（FWD）荷载中心处的路表弯沉**，并按施工顺序给出**逐层验收弯沉**及其衰减规律。
+基于**弹性层状体系理论**计算沥青路面在圆形均布荷载（FWD / 标准轴载）下的弯沉。本仓库提供**两套独立实现**，求解同一物理问题，可相互对拍：
 
-单文件、纯前端、零依赖 —— 打开 `index.html` 即用，不上传任何数据，不联网。
+| 文件 | 形态 | 求解方法 | 输出 |
+| --- | --- | --- | --- |
+| [`index.html`](index.html) | 网页（纯前端，零依赖） | 层刚度矩阵 $\mathbf{K}=\mathbf{B}\mathbf{A}^{-1}$ + 列主元高斯消元 | 竣工弯沉 + **逐层验收弯沉**（分阶段施工） |
+| [`pavement-deflection.py`](pavement-deflection.py) | Python 脚本 / 库 | 状态空间传递矩阵 $\mathbf{T}_i=e^{\mathbf{A}_i h_i}$ + 自适应积分 | 圆心表面沉降 |
+
+两者用同一套默认结构（4 层沥青 + 2 层水稳 + 粒料 + 土基，共 81 cm）与 FWD 标准荷载（50 kN / φ300 mm）算出的竣工弯沉分别为 **14.26** 与 **14.27（0.01 mm）**，相差 0.07% —— 见[默认算例](#默认算例)与[数值校核](#数值校核)。
 
 > 适用场景：路面结构设计方案的弯沉敏感性对比、施工分阶段验收标准的制定与复核、FWD 实测弯沉的量级预判。
 
@@ -10,11 +15,9 @@
 
 ## 快速开始
 
-**在线使用**：直接打开仓库里的 `index.html`（若已开启 GitHub Pages，访问 `https://plutopluto.github.io/pavement-deflection/`）。
+**网页版**：直接打开 `index.html`（若已开启 GitHub Pages，访问 `https://plutopluto.github.io/pavement-deflection/`），或下载后双击用浏览器打开。推荐 Chrome / Edge / Firefox / Safari 近三年版本。页面载入后自动按默认结构算出一组结果，改参数后点击「开始计算」即可重算，单次运算约 0.2 ~ 2 s。
 
-**本地使用**：下载 `index.html`，双击用浏览器打开即可。推荐 Chrome / Edge / Firefox / Safari 近三年版本。
-
-页面载入后自动按默认结构（4 层沥青 + 2 层无机结合料 + 1 层粒料 + 土基，共 81 cm）算出一组结果，改参数后点击「开始计算」即可重算，单次运算约 0.2 ~ 2 s。
+**Python 版**：需 `numpy` + `scipy`，`python pavement-deflection.py` 直接运行，见 [Python 版](#python-版-pavement-deflectionpy) 一节。
 
 ---
 
@@ -194,6 +197,8 @@ $$
 
 土基顶面 297.08 → 竣工 14.26（0.01 mm），全结构使弯沉下降 **95.2%**。可见弯沉的衰减主要发生在前两个阶段 —— 半刚性基层一旦成型，弯沉量级就基本锁定，上部沥青面层的贡献相对有限。
 
+> 同一结构与荷载下，Python 版（`pavement-deflection.py`）算得圆心沉降 **14.27（0.01 mm）**，与网页版相差 0.07%，两套独立实现相互对拍通过。Python 版只算竣工弯沉，不做逐层验收。
+
 ---
 
 ## 数值校核
@@ -207,6 +212,8 @@ $$
 | 40 cm 硬层（$E=3000$ MPa）覆盖软土基 | — | 0.3788 mm | 符合硬层大幅削减弯沉的物理预期 |
 
 第二种工况尤其关键：它检验了多层刚度矩阵组装与层间连续性条件在参数退化时是否自洽（若不连续或组装有误，结果会明显偏离半空间解）。
+
+以上三工况用 Python 版（`pavement-deflection.py`）独立复算，结果分别为 2.9701 / 2.9701 / 0.3791 mm，与网页版吻合 —— 两套实现（层刚度矩阵 vs 传递矩阵）互为参考解。
 
 ---
 
@@ -222,11 +229,77 @@ $$
 
 ```
 pavement-deflection/
-├── index.html    # 全部功能（界面 + 算法），约 1100 行
-└── README.md     # 本文件
+├── index.html               # 网页版：界面 + 算法，约 1100 行
+├── pavement-deflection.py   # Python 版：状态空间传递矩阵法，约 250 行
+└── README.md
 ```
 
-代码内部按注释分为 6 节：Bessel 函数 → 线性代数 → 层刚度矩阵 → 主计算（积分）→ 状态与交互 → 结果渲染。
+`index.html` 内部按注释分为 6 节：Bessel 函数 → 线性代数 → 层刚度矩阵 → 主计算（积分）→ 状态与交互 → 结果渲染。`pavement-deflection.py` 结构见下方 [Python 版](#python-版-pavement-deflectionpy) 一节。
+
+---
+
+## Python 版 (`pavement-deflection.py`)
+
+命令行 / 库形式的实现，采用**状态空间传递矩阵法**，与网页版同源但实现路径不同，适合嵌入批量计算或作为参考解。
+
+### 方法
+
+状态向量 $\mathbf{X}=[\bar u,\ \bar w,\ \bar\sigma_z,\ \bar\tau_{rz}]^\top$ 满足 $\mathrm{d}\mathbf{X}/\mathrm{d}z=\mathbf{A}\,\mathbf{X}$，每层传递矩阵
+
+$$
+\mathbf{T}_i=\exp\!\left(\mathbf{A}_i\,h_i\right)\quad(\text{`scipy.linalg.expm`})
+$$
+
+半无限底层的衰减约束 $\mathbf{R}\mathbf{X}=\mathbf{0}$ 由 $\mathbf{A}$ 的广义特征向量（特征值 $-\xi$，2×2 Jordan 块）解析导出：
+
+$$
+\begin{cases}2G\xi\,\bar u-(1-2\nu)\,\bar\sigma_z+2(1-\nu)\,\bar\tau_{rz}=0\\ 2G\xi\,\bar w+2(1-\nu)\,\bar\sigma_z-(1-2\nu)\,\bar\tau_{rz}=0\end{cases}
+$$
+
+表面应力 Hankel 变换 $\bar\sigma_z(\xi,0)=-p\,a\,J_1(\xi a)/\xi$、$\bar\tau_{rz}=0$（$J_1$ 用 `scipy.special.j1`），圆心沉降
+
+$$
+w(0,0)=\int_0^\infty \bar w(\xi,0)\,\xi\,\mathrm{d}\xi\quad(\text{`scipy.integrate.quad`，自适应，奇点取 }1/a,\ 5/a,\ 10/a)
+$$
+
+内部统一 N–mm–MPa 制，接口层完成 cm↔mm、kN↔N、mm↔0.01 mm 换算。
+
+### 依赖与运行
+
+```bash
+pip install numpy scipy
+python pavement-deflection.py
+# → 圆心处沉降 w = 14.27 (0.01 mm) = 0.1427 mm
+```
+
+作为库使用（文件名含连字符，需 `importlib` 加载）：
+
+```python
+import importlib.util
+spec = importlib.util.spec_from_file_location("pd", "pavement-deflection.py")
+pd = importlib.util.module_from_spec(spec); spec.loader.exec_module(pd)
+
+les = pd.LayeredElasticSystem(
+    layers=[(4,9800,0.25),(6,12500,0.25),(8,11500,0.25),(12,9000,0.25),
+            (18,14000,0.25),(18,12000,0.25),(15,300,0.35),
+            (float('inf'),60,0.4)],
+    force_kN=50, radius_cm=15,
+)
+print(les.center_settlement())      # 14.27  (0.01 mm)
+print(les.center_settlement_mm())   # 0.1427 (mm)
+```
+
+**输入约定**：`layers=[(h_cm, E_MPa, ν), ...]`，最后一层厚度填 `float('inf')` 表示半无限土基；输出 `center_settlement()` 单位 **0.01 mm**，`center_settlement_mm()` 单位 mm。非法输入（模量 ≤ 0、泊松比越界、非底层厚度无限等）抛 `ValueError` 并带层号。
+
+### 校核
+
+| 工况 | 解析 / 参考 | 本程序 |
+| --- | --- | --- |
+| 均质半空间 $E=60,\ \nu=0.4$（$w=2pa(1-\nu^2)/E$） | 2.9709 mm | 2.9701 mm（0.026%） |
+| 4 层全同材料退化为半空间 | 2.9709 mm | 2.9701 mm |
+| 40 cm 硬层（$E=3000$）覆盖软土基 | 网页版 0.3788 mm | 0.3791 mm |
+
+半空间误差略大于网页版（0.026% vs 0.003%），原因是积分上限取 $\xi_{\max}=40/a$（网页版延伸到 $500/a$ 并加尾部渐近修正）；对工程量级无影响，需要更高精度时给 `center_settlement(xi_max=...)` 传更大的值。
 
 ---
 
