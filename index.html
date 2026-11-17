@@ -506,11 +506,42 @@ function solveAt(L, xi) {
   return W;
 }
 
+/* ---------------------------------------------------------
+   起始段 [0, ξ0]（ξ0 = 0.01/a）的高精度积分
+   -----------------------------------------------------------
+   被积函数 f(ξ) = C(ξ)·J₁(ξa)（C = ξ·W）在 ξ→0 处是 0×∞ 型
+   可去奇点：W ~ C/ξ、J₁(ξa) ~ ξa/2，f 有有限极限。但在 (0, ξ0]
+   上 f 并非常数——层数越多、顶层越软，段内 f 可下降 10% 以上
+   （R08 算例：ξ/ξ0 = 1 处已降到 0.8646）。两点线性外推相当于把
+   整段当常数核，本段偏低 4%，修复前 R08 的总偏差几乎全部来自这里。
+
+   改用换元 ξ = ξ0·u²：
+       ∫₀^ξ0 f dξ = ξ0·∫₀¹ 2u·f(ξ0u²) du
+   被积函数 g(u) = 2u·f(ξ0u²) 在 u = 0 处解析地为 0，全段光滑，
+   复合 Simpson（16 段）即可达 1e-7 相对精度；n 节点中最内点
+   ξ0/256 上 W 仍为有限大数（~1/ξ），不会溢出。
+   --------------------------------------------------------- */
+const START_BAND_PANELS = 16;
+
+function addStartBand(accW, L, xi0, a) {
+  const n = accW.length, m = START_BAND_PANELS, h = 1 / m;
+  for (let k = 1; k <= m; k++) {                 /* k = 0 时 g(0) ≡ 0，跳过 ξ=0 */
+    const u = k * h;
+    const xi = xi0 * u * u;
+    const W = solveAt(L, xi);
+    if (!W) continue;
+    const wk = (k === m) ? 1 / 3 : (k % 2 ? 4 / 3 : 2 / 3);
+    const coef = xi0 * h * wk * 2 * u * besselJ1(xi * a);
+    for (let j = 0; j < n; j++) accW[j] += coef * W[j];
+  }
+}
+
 /* =========================================================
    4. 主计算：各层顶面弯沉（荷载中心 r = 0）
       w(0) = p·a·∫₀^∞ C(ξ)·J₁(ξa) dξ
 
       采用变步长复合 Simpson 积分：
+      · 起始段 [0, 0.01/a] 由 addStartBand 换元后单独高精度积分
       · 低频段（ξ < 3/h_max）C(ξ) 变化剧烈，用细步长 0.001/a
       · 中频段              J₁ 振荡为主，用中步长 0.02/a
       · 高频段（ξ > 100/a）被积函数极小，   用粗步长 0.1/a
@@ -533,7 +564,6 @@ function computeDeflection(L, p, a) {
   const xiMax = 500 / a;
 
   const accW = new Float64Array(n);
-  let Wfirst = null;
 
   for (let si = 0; si < segs.length; si++) {
     const sStart = segs[si][0], sEnd = segs[si][1], sDxi = segs[si][2];
@@ -544,31 +574,27 @@ function computeDeflection(L, p, a) {
       const xi = sStart + k * realDxi;
       const W = solveAt(L, xi);
       if (!W) continue;
-      if (xi <= xi0 + 1e-12) Wfirst = W;
       const wt = realDxi * ((k === 0 || k === kEnd) ? 1 / 3 : (k % 2 ? 4 / 3 : 2 / 3)) * besselJ1(xi * a);
       for (let j = 0; j < n; j++) accW[j] += wt * W[j];
     }
   }
 
-  /* 起始奇异段 [0, ξ0]：W ~ C/ξ, J1(ξa) ~ ξa/2，被积函数趋于 C·a/2 */
-  if (Wfirst) {
-    const g1 = besselJ1(xi0 * a);
-    for (let j = 0; j < n; j++) {
-      const Cj = xi0 * Wfirst[j];
-      accW[j] += xi0 * (Cj * a / 2 + Wfirst[j] * g1) / 2;
-    }
-  }
+  /* 起始段 [0, ξ0]：换元 ξ = ξ0·u² 后复合 Simpson（见 addStartBand 注释） */
+  addStartBand(accW, L, xi0, a);
 
   /* 尾部修正 [ξMax, ∞)：
      高频时 C(ξ) → 2(1-μ_top²)/(E_top·ξ)（顶层退化为半空间）
      ∫_{ξMax}^∞ C·J₁(ξa) dξ = [2(1-μ²)/E]·∫_{xMax}^∞ J₁(t)/t dt
-     xMax = 500 时 J₁(t)/t 量级 ~1e-5，尾部贡献极小，粗步长即可  */
+     J₁(t)/t 以 t^(-3/2) 衰减但持续振荡，xMax = 500 处该尾部积分
+     本身约 -6.8e-5；原窗口只积到 xMax+400（约 64 个周期），仅捕获
+     68%，给总弯沉带来 ~2e-5 的系统性偏差。现取 8·xMax 跨度、步长
+     0.2（约 32 点/周期，637 个周期），截断与步长误差均降到 1e-3 以下。 */
   const Etop = L[0].E, nutop = L[0].mu;
   const xMax = xiMax * a;                              /* = 500 */
   const tailCoeff = 2 * (1 - nutop * nutop) / Etop;
   let tailInt = 0;
   {
-    const td = 0.5, tEnd = xMax + 400;               /* 覆盖 ~64 个振荡周期 */
+    const td = 0.2, tEnd = xMax + 8 * xMax;          /* 覆盖 ~637 个振荡周期 */
     const tk = Math.ceil((tEnd - xMax) / td);
     for (let s = 0; s <= tk; s++) {
       const t = xMax + s * td;

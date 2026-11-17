@@ -30,6 +30,21 @@
   表面边界：σ̄_z(ξ,0) = -p·a·J₁(ξa)/ξ,  τ̄_rz(ξ,0) = 0
   逆变换：w(0,0) = ∫₀^∞ w̄(ξ,0)·ξ dξ
   其中 p = P/(πa²) 为均布荷载强度，a 为荷载半径（内部均用 mm）。
+
+━━━ 数值积分：渐近减除 ━━━
+  w̄(ξ) 在 ξ→∞ 时趋于顶层半空间核 c·J₁(ξa)/ξ²，c = 2(1-ν₁²)pa/E₁。
+  先把该核从被积函数中减去、再把它的解析积分补回：
+
+      w = c + ∫₀^{ξ_max} [ w̄(ξ)·ξ − c·J₁(ξa)/ξ ] dξ
+          ⌐ 这里用了 ∫₀^∞ c·J₁(ξa)/ξ dξ = c（即半空间圆心沉降）
+
+  差值核随 e^{−2ξh₁} 快速衰减（ξh₁ ≳ 25 时已低于 1e-9），因此 ξ_max 只要
+  取 max(25, 8a/h₁)/a；若直接在 ξ_max 处截断原被积函数，残余约
+  2(1-ν₁²)pa/E₁·J₀(ξ_max·a)，按 X^(-1/2) 振荡衰减且符号随相位翻转，加
+  大上限收效甚微，这是渐近减除要解决的问题。
+
+  被积函数含 J₁(ξa)，按半周期 π/a 分段积分，避免长区间强振荡的假收敛；
+  传递矩阵逐层归一化，防止大 ξ·h 时 expm 元素按 e^{ξh} 溢出。
 """
 
 import numpy as np
@@ -65,7 +80,18 @@ class LayeredElasticSystem:
         均布荷载合力 P（kN）。
     radius_cm : float
         荷载圆半径 r（cm）。
+
+    Attributes
+    ----------
+    ASYM_XI_FACTOR : float
+        积分上限的下限系数，ξ_max ≥ ASYM_XI_FACTOR/a（缺省 25，对应 ξh₁≈25，
+        差值核已衰减到 1e-9 以下）。
+    XI_H_SAFE : float
+        expm 溢出保护阈值：任一有限层的 ξ·h 超过该值即截断上限（缺省 650）。
     """
+
+    XI_H_SAFE = 650.0         # 传递矩阵元素按 e^{ξh} 增长，ξh≳700 时 expm 溢出
+    ASYM_XI_FACTOR = 25.0     # ξ_max·a 下限：差值核在此已衰减到 1e-9
 
     def __init__(self, layers, force_kN, radius_cm):
         self.layers = layers
@@ -177,6 +203,11 @@ class LayeredElasticSystem:
             A_i = self._A_matrix(xi, E, nu)
             T_i = expm(A_i * h)
             T_total = T_i @ T_total
+            # 逐层归一化：链式乘积是线性齐次的，整体缩放不改变最终解，
+            # 但可避免大 ξ（长层）时 T 元素按 e^{ξh} 溢出。
+            scale = np.max(np.abs(T_total))
+            if np.isfinite(scale) and scale > 1e8:
+                T_total /= scale
 
         E0, nu0 = self._layers_mm[-1][1], self._layers_mm[-1][2]
         R = self._decay_constraint(xi, E0, nu0)
@@ -189,23 +220,62 @@ class LayeredElasticSystem:
         sol = np.linalg.solve(A_sys, b_sys)
         return sol[1]
 
-    def _surface_deflection_mm(self, xi_max=None):
-        """圆心沉降，内部 mm 单位。w = ∫₀^∞ w̄·ξ dξ"""
+    def _xi_max(self):
+        """
+        积分上限（1/mm）。
+
+        差值核按 e^{−2ξh₁} 衰减，ξh₁ ≳ 25 时已低于 1e-9，故 ξ_max·a 至少取
+        ASYM_XI_FACTOR；顶层很薄时（h₁ → 0）衰减变慢，按 8a/h₁ 自动放大。
+        再按 expm 溢出条件封顶（见 XI_H_SAFE）。
+        """
         a = self._a_mm
-        if xi_max is None:
-            xi_max = 40.0 / a
+        h1 = self._layers_mm[0][0]
+        xi_max = max(self.ASYM_XI_FACTOR, 8.0 * a / h1) / a
+        if self.N > 1:
+            h_max = max(h for h, _, _ in self._layers_mm[:-1])
+            xi_max = min(xi_max, self.XI_H_SAFE / h_max)
+        return xi_max
+
+    def _surface_deflection_mm(self):
+        """
+        圆心沉降（内部 mm 单位）。渐近减除后：
+
+            w = c + ∫₀^{ξ_max} [ w̄(ξ)·ξ − c·J₁(ξa)/ξ ] dξ
+        """
+        a = self._a_mm
+        p = self._p_MPa
+        E1, nu1 = self._layers_mm[0][1], self._layers_mm[0][2]
+
+        # 顶层半空间核的解析积分：∫₀^∞ c·J₁(ξa)/ξ dξ = c（= 半空间圆心沉降）
+        c = 2.0 * (1.0 - nu1 ** 2) * p * a / E1
 
         def integrand(xi):
-                return self._solve_at_xi(xi) * xi
+            if xi <= 0.0:
+                return 0.0                     # 差值的 ξ→0 极限为 0
+            return self._solve_at_xi(xi) * xi - c * j1(xi * a) / xi
 
+        xi_max = self._xi_max()
 
-        result, _ = quad(integrand, 0, xi_max,
-                         limit=200, points=[1.0/a, 5.0/a, 10.0/a],
-                         epsabs=1e-12, epsrel=1e-10)
-        return result
+        # 被积函数含 J₁(ξa)，零点间隔为 π/a。按半周期分段后每段只含一个半波，
+        # 函数光滑、幅度单调衰减，一次 Gauss–Kronrod 即可收敛到接近机器精度；
+        # 若整段一次积分，长区间强振荡会触发"假收敛"（误差估计偏小而结果偏差大）。
+        n_seg = max(1, int(np.ceil(xi_max * a / np.pi)))
+        edges = np.linspace(0.0, xi_max, n_seg + 1)
+
+        # 相对容差 1e-8：高频段的差值核已进入核函数自身的舍入噪声，按更严的
+        # 容差逼 quad 细分到上限，既慢又不更准。
+        total = c
+        epsabs = 1e-11 * abs(c)
+        epsrel = 1e-8
+
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            val, _ = quad(integrand, lo, hi, limit=100,
+                          epsabs=epsabs, epsrel=epsrel)
+            total += val
+        return total
 
     # ── 公开接口 ──
-    def center_settlement(self, xi_max=None):
+    def center_settlement(self):
         """
         计算圆心处表面沉降。
 
@@ -214,12 +284,11 @@ class LayeredElasticSystem:
         float
             沉降值，单位 **0.01 mm**（百分之一毫米）。
         """
-        w_mm = self._surface_deflection_mm(xi_max)
-        return w_mm * MM_TO_001MM
+        return self._surface_deflection_mm() * MM_TO_001MM
 
-    def center_settlement_mm(self, xi_max=None):
+    def center_settlement_mm(self):
         """沉降值，单位 mm（便于对照）。"""
-        return self._surface_deflection_mm(xi_max)
+        return self._surface_deflection_mm()
 
 
 # ──────────────────────────────────────────────
